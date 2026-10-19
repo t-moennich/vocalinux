@@ -46,6 +46,21 @@ class TestChannels:
         assert normalize_channel("stable") == "stable"
         assert normalize_channel("NIGHTLY") == "nightly"
         assert normalize_channel("nope") == "stable"
+        assert normalize_channel("off") == "off"
+        assert normalize_channel(" OFF ") == "off"
+
+    def test_off_channel_never_reports_update(self):
+        release = ReleaseInfo(
+            tag_name="v0.99.0",
+            version="0.99.0",
+            name="v0.99.0",
+            html_url="https://github.com/VocaHQ/vocalinux/releases/tag/v0.99.0",
+            body="",
+            published_at="2026-08-06T00:00:00Z",
+            prerelease=False,
+            channel="stable",
+        )
+        assert not is_update_available("0.15.0", release, "off")
 
     def test_stable_update_uses_semver(self):
         release = ReleaseInfo(
@@ -116,6 +131,14 @@ class TestFormatReleaseNotes:
 
 
 class TestFetchLatestRelease:
+    def test_off_channel_skips_network(self):
+        mock_requests = MagicMock()
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            assert fetch_latest_release(channel="off") is None
+
+        mock_requests.get.assert_not_called()
+
     def test_returns_none_on_network_error(self):
         mock_requests = MagicMock()
         mock_requests.get.side_effect = Exception("offline")

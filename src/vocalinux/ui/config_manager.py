@@ -251,8 +251,9 @@ DEFAULT_CONFIG = {
         "whispercpp_gpu_device": None,  # None = auto-select discrete GPU; int = specific device index
     },
     "updates": {
-        # "stable" follows GitHub /releases/latest; "nightly" follows nightly-YYYY-MM-DD tags.
-        "channel": "stable",
+        # "off" disables update checks; "stable" follows GitHub /releases/latest;
+        # "nightly" follows nightly-YYYY-MM-DD tags.
+        "channel": "off",
         # Tag last announced via desktop notification (avoids re-notifying every 6h).
         "last_notified_version": "",
     },

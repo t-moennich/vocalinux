@@ -32,6 +32,24 @@ class TestUpdateMonitor:
         monitor.stop()
         assert not monitor._running
 
+    def test_off_channel_skips_check(self):
+        channel = {"value": "off"}
+        on_result = MagicMock()
+        monitor = UpdateMonitor(
+            get_channel=lambda: channel["value"],
+            on_result=on_result,
+            use_glib=False,
+        )
+        monitor.start()
+
+        with patch("vocalinux.utils.update_monitor.fetch_latest_release") as fetch_mock:
+            monitor._run_check()
+
+        fetch_mock.assert_not_called()
+        on_result.assert_not_called()
+        assert not monitor._check_in_progress
+        monitor.stop()
+
     def test_reports_available_update(self):
         on_result = MagicMock()
         release = _release("v0.99.0")

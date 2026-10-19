@@ -49,7 +49,7 @@ from ..speech_recognition.diarization import (
 from ..suspend_handler import SuspendHandler
 from ..utils.host_process import host_env
 from ..utils.resource_manager import ResourceManager
-from ..utils.update_checker import ReleaseInfo
+from ..utils.update_checker import ReleaseInfo, normalize_channel
 from ..utils.update_monitor import UpdateMonitor
 from ..utils.whispercpp_model_info import TDRZ_MODEL, WHISPERCPP_MODEL_INFO, is_model_downloaded
 from . import notifications
@@ -291,7 +291,8 @@ class TrayIndicator:
             get_channel=self._get_update_channel,
             on_result=self._on_update_check_result,
         )
-        self._update_monitor.start()
+        if normalize_channel(self._get_update_channel()) != "off":
+            self._update_monitor.start()
 
         # Set up keyboard shortcuts with mode support
         self._setup_keyboard_shortcuts()
@@ -1366,7 +1367,7 @@ class TrayIndicator:
 
     def _get_update_channel(self) -> str:
         """Return the configured release channel for background update checks."""
-        return self.config_manager.get_str("updates", "channel", "stable")
+        return self.config_manager.get_str("updates", "channel", "off")
 
     def _on_update_check_result(self, available: bool, release: Optional[ReleaseInfo]):
         """Handle a background update-check result (already on the GLib main loop)."""

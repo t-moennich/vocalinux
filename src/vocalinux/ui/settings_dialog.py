@@ -6686,18 +6686,22 @@ class SettingsDialog(Gtk.Dialog):
 
         updates_group = PreferencesGroup(
             title="Updates",
-            description="Stable for numbered releases. Nightly for dated development builds.",
+            description=(
+                "Stable for numbered releases. Nightly for dated development builds. "
+                "Off for no checks."
+            ),
             keywords=("update", "version", "release", "upgrade", "appimage", "nightly", "channel"),
         )
 
         self.update_channel_combo = Gtk.ComboBoxText()
         self.update_channel_combo.append("stable", "Stable")
         self.update_channel_combo.append("nightly", "Nightly")
+        self.update_channel_combo.append("off", "Off")
         _combo_chrome(
             self.update_channel_combo,
             tooltip=(
                 "Stable uses the latest numbered release. Nightly uses the newest "
-                "nightly-YYYY-MM-DD build."
+                "nightly-YYYY-MM-DD build. Off disables update checks."
             ),
         )
         saved_channel = normalize_channel(
@@ -6827,6 +6831,18 @@ class SettingsDialog(Gtk.Dialog):
     def _start_update_check(self):
         """Kick off a background GitHub release lookup."""
         channel = self._current_update_channel()
+        if channel == "off":
+            # Invalidates any in-flight lookup; its result is then ignored.
+            self._update_check_generation += 1
+            self.check_updates_btn.set_sensitive(True)
+            self.check_updates_btn.set_label("Check")
+            self.update_status_row.set_subtitle("Update checks are off")
+            self._pending_update = None
+            self._set_about_update_badge(False)
+            if self.update_status_callback is not None:
+                self.update_status_callback(False, None)
+            return
+
         self._update_check_generation += 1
         generation = self._update_check_generation
         self.check_updates_btn.set_sensitive(False)

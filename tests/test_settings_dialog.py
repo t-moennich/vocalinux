@@ -1309,6 +1309,7 @@ class TestAboutPage(unittest.TestCase):
         self.assertIn("What's New", self.about)
         self.assertIn("_on_check_updates_clicked", self.about)
         self.assertIn("self.update_channel_combo", self.about)
+        self.assertIn('append("off", "Off")', self.about)
 
     def test_product_status_and_honest_network_copy(self):
         self.assertIn("Available now on Linux (X11 and Wayland)", self.about)

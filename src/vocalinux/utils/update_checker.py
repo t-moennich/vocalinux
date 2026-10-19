@@ -11,7 +11,7 @@ from .proxy import requests_proxies
 
 logger = logging.getLogger(__name__)
 
-UPDATE_CHANNELS = ("stable", "nightly")
+UPDATE_CHANNELS = ("stable", "nightly", "off")
 DEFAULT_UPDATE_CHANNEL = "stable"
 
 _GITHUB_REPO_RE = re.compile(r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
@@ -116,6 +116,8 @@ def is_update_available(
 ) -> bool:
     """Return whether ``latest`` is an update for ``current`` on the given channel."""
     channel = normalize_channel(channel)
+    if channel == "off":
+        return False
     if channel == "nightly":
         current_tag = current.strip()
         if current_tag == latest.tag_name or normalize_version(current_tag) == latest.version:
@@ -251,6 +253,8 @@ def fetch_latest_release(
     import requests
 
     channel = normalize_channel(channel)
+    if channel == "off":
+        return None
     api_base = _repo_api_base(repo_url)
     headers = {
         "Accept": "application/vnd.github+json",

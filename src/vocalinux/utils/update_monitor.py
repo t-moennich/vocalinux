@@ -112,10 +112,14 @@ class UpdateMonitor:
     def _run_check(self) -> None:
         if self._check_in_progress:
             return
+        channel = self._current_channel()
+        if channel == "off":
+            # Keep the timer armed so a later switch to a real channel is checked.
+            self._schedule(self._check_interval)
+            return
         self._check_in_progress = True
         self._generation += 1
         generation = self._generation
-        channel = self._current_channel()
         threading.Thread(
             target=self._worker,
             args=(channel, __version__, generation),
