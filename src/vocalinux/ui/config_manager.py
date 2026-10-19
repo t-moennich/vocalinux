@@ -133,6 +133,9 @@ DEFAULT_CONFIG = {
         # Push-to-talk: send a long dictation to the engine in chunks. A chunk ends at the
         # first pause after chunk_min_seconds, or at chunk_max_seconds without a pause.
         "chunk_min_seconds": 20,
+        # Silence this long, after at least chunk_min_seconds of speech, ends a chunk.
+        # Independent of silence_timeout.
+        "chunk_pause_seconds": 0.6,
         "chunk_max_seconds": 120,
         # Keep each dictation as WAV + JSON in $XDG_CACHE_HOME/vocalinux/recordings
         # for recovery, and delete files older than recordings_retention_hours.

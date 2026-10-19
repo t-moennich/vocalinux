@@ -215,6 +215,7 @@ def _run_recording_transcription(path: str, args: argparse.Namespace) -> int:
             vad_sensitivity=saved.get("vad_sensitivity", 3),
             silence_timeout=saved.get("silence_timeout", 2.0),
             chunk_min_seconds=saved.get("chunk_min_seconds", 20),
+            chunk_pause_seconds=saved.get("chunk_pause_seconds", 0.6),
             chunk_max_seconds=saved.get("chunk_max_seconds", 120),
             voice_commands_enabled=saved.get("voice_commands_enabled"),
             whispercpp_no_timestamps=advanced.get("whispercpp_no_timestamps", True),
@@ -608,6 +609,7 @@ def main():
     stop_sound_guard_ms = saved_settings.get("stop_sound_guard_ms", 200)
     max_recording_minutes = saved_settings.get("max_recording_minutes", 30)
     chunk_min_seconds = saved_settings.get("chunk_min_seconds", 20)
+    chunk_pause_seconds = saved_settings.get("chunk_pause_seconds", 0.6)
     chunk_max_seconds = saved_settings.get("chunk_max_seconds", 120)
     save_recordings = saved_settings.get("save_recordings", True)
     recordings_retention_hours = saved_settings.get("recordings_retention_hours", 24)
@@ -657,6 +659,7 @@ def main():
             stop_sound_guard_ms=stop_sound_guard_ms,
             max_recording_minutes=max_recording_minutes,
             chunk_min_seconds=chunk_min_seconds,
+            chunk_pause_seconds=chunk_pause_seconds,
             chunk_max_seconds=chunk_max_seconds,
             save_recordings=save_recordings,
             recordings_retention_hours=recordings_retention_hours,

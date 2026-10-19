@@ -199,6 +199,86 @@ class TestChunkedPushToTalk:
         assert texts == ["eins zwei"]
         assert segments == ["eins zwei"]
 
+    def test_short_pause_splits_with_long_silence_timeout(self, manager):
+        """The split rule does not wait for silence_timeout."""
+        manager.silence_timeout = 3.0
+        texts, _ = collect_texts(manager)
+        calls = script_transcripts(manager, "eins", "zwei")
+        script = (
+            [SPEECH] * chunks_for(22)
+            + [SILENCE] * chunks_for(0.8)
+            + [SPEECH] * chunks_for(10)
+            + [SILENCE] * 2
+        )
+        run_session(manager, script, "push_to_talk")
+        assert len(calls) == 2
+        assert calls[0] == pytest.approx(22.8, abs=0.3)
+        assert texts == ["eins zwei"]
+
+    def test_pause_shorter_than_chunk_pause_does_not_split(self, manager):
+        manager.silence_timeout = 3.0
+        texts, _ = collect_texts(manager)
+        calls = script_transcripts(manager, "alles")
+        script = (
+            [SPEECH] * chunks_for(22)
+            + [SILENCE] * chunks_for(0.3)
+            + [SPEECH] * chunks_for(10)
+            + [SILENCE] * 2
+        )
+        run_session(manager, script, "push_to_talk")
+        assert len(calls) == 1
+        assert texts == ["alles"]
+
+    def test_chunk_pause_seconds_is_configurable(self, manager):
+        manager.chunk_pause_seconds = 1.5
+        calls = script_transcripts(manager, "a", "b")
+        script = (
+            [SPEECH] * chunks_for(22)
+            + [SILENCE] * chunks_for(1.0)
+            + [SPEECH] * chunks_for(3)
+            + [SILENCE] * chunks_for(1.6)
+            + [SPEECH] * chunks_for(3)
+        )
+        run_session(manager, script, "push_to_talk")
+        assert len(calls) == 2
+        assert calls[0] > 27
+
+    def test_state_stays_listening_while_chunks_are_transcribed(self, manager):
+        states = []
+        manager.register_state_callback(states.append)
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_transcribe(audio_buffer, language=None):
+            started.set()
+            release.wait(5)
+            return "text"
+
+        manager._transcribe_segment = slow_transcribe
+        use_script(manager, [SPEECH] * chunks_for(25) + [SILENCE] * chunks_for(1) + [SPEECH] * 5)
+        assert manager.start_recognition(mode="push_to_talk")
+        manager.audio_thread.join(10)
+        assert started.wait(5)
+        # The chunk is being transcribed and the key is still held.
+        assert manager.state == RecognitionState.LISTENING
+        assert RecognitionState.PROCESSING not in states
+        release.set()
+        manager.stop_recognition()
+        manager.recognition_thread.join(10)
+        assert manager.state == RecognitionState.IDLE
+
+    def test_release_while_processing_still_stops(self, manager):
+        texts, _ = collect_texts(manager)
+        script_transcripts(manager, "text")
+        use_script(manager, [], endless_chunk=SPEECH, delay=0.0005)
+        assert manager.start_recognition(mode="push_to_talk")
+        manager._update_state(RecognitionState.PROCESSING)
+        manager.stop_recognition()
+        manager.recognition_thread.join(10)
+        assert manager.state == RecognitionState.IDLE
+        assert not manager.should_record
+        assert texts == ["text"]
+
     def test_pause_before_minimum_does_not_split(self, manager):
         texts, _ = collect_texts(manager)
         calls = script_transcripts(manager, "alles")
@@ -470,6 +550,15 @@ class TestSplitLikeDictation:
         chunks = self.split(self.pcm((25, 5000), (2, 0), (10, 5000)))
         assert len(chunks) == 2
         assert len(chunks[0]) / 16000 == pytest.approx(25.5, abs=0.2)
+
+    def test_splits_at_chunk_pause_despite_long_silence_timeout(self):
+        chunks = self.split(self.pcm((22, 5000), (0.8, 0), (10, 5000)), silence_timeout=3.0)
+        assert len(chunks) == 2
+        assert len(chunks[0]) / 16000 == pytest.approx(22.6, abs=0.2)
+
+    def test_pause_shorter_than_chunk_pause_does_not_split(self):
+        pcm = self.pcm((22, 5000), (0.3, 0), (10, 5000))
+        assert len(self.split(pcm, silence_timeout=3.0)) == 1
 
     def test_short_pause_inside_minimum_does_not_split(self):
         assert len(self.split(self.pcm((5, 5000), (2, 0), (5, 5000)))) == 1

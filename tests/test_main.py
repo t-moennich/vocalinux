@@ -238,6 +238,7 @@ class TestMainModule(unittest.TestCase):
                 stop_sound_guard_ms=200,
                 max_recording_minutes=30,
                 chunk_min_seconds=20,
+                chunk_pause_seconds=0.6,
                 chunk_max_seconds=120,
                 save_recordings=True,
                 recordings_retention_hours=24,

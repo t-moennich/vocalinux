@@ -426,6 +426,7 @@ class SpeechRecognitionManager:
         self.stop_sound_guard_ms = kwargs.get("stop_sound_guard_ms", 200)
         self.max_recording_minutes = kwargs.get("max_recording_minutes", 30)
         self.chunk_min_seconds = kwargs.get("chunk_min_seconds", 20)
+        self.chunk_pause_seconds = kwargs.get("chunk_pause_seconds", 0.6)
         self.chunk_max_seconds = kwargs.get("chunk_max_seconds", 120)
         self.save_recordings = kwargs.get("save_recordings", True)
         self.recordings_retention_hours = kwargs.get("recordings_retention_hours", 24)
@@ -643,6 +644,7 @@ class SpeechRecognitionManager:
     #: Class-level defaults for managers built without ``__init__``.
     max_recording_minutes: float = 30
     chunk_min_seconds: float = 20
+    chunk_pause_seconds: float = 0.6
     chunk_max_seconds: float = 120
     save_recordings: bool = True
     recordings_retention_hours: float = 24
@@ -3606,6 +3608,8 @@ class SpeechRecognitionManager:
 
             # Record audio while should_record is True
             silence_counter = 0
+            # Length of the current silence run, for the chunk split rule.
+            pause_seconds = 0.0
             speech_detected_in_session = False
             self._recording_segment_has_speech = False
             log_level_interval = 0  # Counter for periodic level logging
@@ -3720,6 +3724,7 @@ class SpeechRecognitionManager:
 
                     if not is_speech:  # Silence
                         silence_counter += CHUNK / RATE  # Convert chunks to seconds
+                        pause_seconds += CHUNK / RATE
                         if silence_counter > self.silence_timeout:
                             if len(self.audio_buffer) > 0:
                                 if not self._recording_segment_has_speech:
@@ -3727,17 +3732,6 @@ class SpeechRecognitionManager:
                                         "Silence detected with no speech, dropping audio buffer"
                                     )
                                     self.audio_buffer = []
-                                elif self._can_split_segment() and (
-                                    segment_samples >= self.chunk_min_seconds * SAMPLE_RATE
-                                ):
-                                    session.log(
-                                        logging.INFO,
-                                        "Pause after %.1fs of speech, " "splitting a chunk",
-                                        segment_samples / SAMPLE_RATE,
-                                    )
-                                    self._enqueue_audio_segment(self.audio_buffer, partial=True)
-                                    self.audio_buffer = []
-                                    self._recording_segment_has_speech = False
                                 elif self._recognition_mode == "push_to_talk" or getattr(
                                     self, "_reload_pending", False
                                 ):
@@ -3765,22 +3759,36 @@ class SpeechRecognitionManager:
                                 )
                             speech_detected_in_session = True
                         silence_counter = 0
+                        pause_seconds = 0.0
 
-                    # No pause arrived: split a chunk that grew too long.
+                    # Long push-to-talk speech goes on in chunks: at the first pause
+                    # of chunk_pause_seconds once the chunk holds chunk_min_seconds,
+                    # or at chunk_max_seconds if no pause arrives.
                     if (
                         self.audio_buffer
                         and self._recording_segment_has_speech
                         and self._can_split_segment()
-                        and segment_samples >= self.chunk_max_seconds * SAMPLE_RATE
                     ):
-                        session.log(
-                            logging.INFO,
-                            "No pause in %.1fs of speech, forcing a chunk split",
-                            segment_samples / SAMPLE_RATE,
-                        )
-                        self._enqueue_audio_segment(self.audio_buffer, partial=True)
-                        self.audio_buffer = []
-                        self._recording_segment_has_speech = False
+                        split_reason = None
+                        if segment_samples >= self.chunk_max_seconds * SAMPLE_RATE:
+                            split_reason = "No pause"
+                        elif (
+                            not is_speech
+                            and pause_seconds >= self.chunk_pause_seconds
+                            and segment_samples >= self.chunk_min_seconds * SAMPLE_RATE
+                        ):
+                            split_reason = "Pause"
+                        if split_reason:
+                            session.log(
+                                logging.INFO,
+                                "%s after %.1fs of audio, splitting a chunk",
+                                split_reason,
+                                segment_samples / SAMPLE_RATE,
+                            )
+                            self._enqueue_audio_segment(self.audio_buffer, partial=True)
+                            self.audio_buffer = []
+                            self._recording_segment_has_speech = False
+                            pause_seconds = 0.0
                 except (IOError, OSError) as e:
                     current_time = time.time()
                     logger.error(f"Audio device error: {e}")
@@ -4027,7 +4035,8 @@ class SpeechRecognitionManager:
     def transcribe_file(self, path: str) -> str:
         """Transcribe an audio file the way a push-to-talk dictation would.
 
-        The file is split at pauses (chunk_min_seconds, chunk_max_seconds), each
+        The file is split at pauses (chunk_pause_seconds, chunk_min_seconds,
+        chunk_max_seconds), each
         chunk is transcribed and the texts are joined and post-processed once.
         Nothing is injected; the text is returned.
         """
@@ -4047,6 +4056,7 @@ class SpeechRecognitionManager:
             self.silence_timeout,
             self.chunk_min_seconds,
             self.chunk_max_seconds,
+            self.chunk_pause_seconds,
         )
 
         session = DictationSession(
@@ -4168,7 +4178,11 @@ class SpeechRecognitionManager:
                                 logger.debug(
                                     f"Recognition loop - processing remaining segment with {len(remaining_segment)} chunks"
                                 )
-                                if self.should_record and self._segment_queue is segment_queue:
+                                if (
+                                    self.should_record
+                                    and self._segment_queue is segment_queue
+                                    and not getattr(remaining_segment, "partial", False)
+                                ):
                                     self._update_state(RecognitionState.PROCESSING)
                                 self._process_queued_segment(
                                     session, remaining_segment, remaining_language
@@ -4180,7 +4194,11 @@ class SpeechRecognitionManager:
 
                 segment, segment_language = queued
                 logger.debug(f"Recognition loop - processing segment with {len(segment)} chunks")
-                current = self._segment_queue is segment_queue
+                # A chunk of a running push-to-talk session is transcribed in the
+                # background; the state stays LISTENING until the key is released.
+                current = self._segment_queue is segment_queue and not getattr(
+                    segment, "partial", False
+                )
                 if self.should_record and current:
                     self._update_state(RecognitionState.PROCESSING)
                 self._process_queued_segment(session, segment, segment_language)
