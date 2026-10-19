@@ -13,6 +13,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
+from .utils.file_logging import setup_file_logging
 from .utils.vosk_model_info import SUPPORTED_LANGUAGES
 from .version import __version__
 
@@ -130,6 +131,15 @@ def parse_arguments():
             "TinyDiarize model, print the transcript, and exit"
         ),
     )
+    parser.add_argument(
+        "--transcribe",
+        type=str,
+        metavar="PATH",
+        help=(
+            "Re-transcribe a saved recording with the configured engine and model, "
+            "split into chunks like a dictation, print the text, and exit"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -181,6 +191,65 @@ def _run_file_transcription(path: str) -> int:
     transcript = format_transcript(blocks)
     print(transcript if transcript else "vocalinux: no speech detected")
     return 0
+
+
+def _run_recording_transcription(path: str, args: argparse.Namespace) -> int:
+    """Headless ``--transcribe`` path: dictation-style transcription, printed, no injection."""
+    from .speech_recognition import recognition_manager
+    from .ui.config_manager import get_shared_config_manager
+
+    config_manager = get_shared_config_manager()
+    saved = config_manager.get_settings().get("speech_recognition", {})
+    advanced = config_manager.get_settings().get("advanced", {})
+    engine = args.engine or saved.get("engine", "whisper_cpp")
+    language = args.language or saved.get("language", "auto")
+    language = recognition_manager.normalize_language_for_engine(engine, language)
+    model_size = args.model or config_manager.get_model_size_for_engine(engine)
+
+    try:
+        manager = recognition_manager.SpeechRecognitionManager(
+            engine=engine,
+            model_size=model_size,
+            language=language,
+            defer_download=True,
+            vad_sensitivity=saved.get("vad_sensitivity", 3),
+            silence_timeout=saved.get("silence_timeout", 2.0),
+            chunk_min_seconds=saved.get("chunk_min_seconds", 20),
+            chunk_max_seconds=saved.get("chunk_max_seconds", 120),
+            voice_commands_enabled=saved.get("voice_commands_enabled"),
+            whispercpp_no_timestamps=advanced.get("whispercpp_no_timestamps", True),
+            whispercpp_no_context=advanced.get("whispercpp_no_context", True),
+            whispercpp_initial_prompt=advanced.get("whispercpp_initial_prompt", ""),
+            whispercpp_language_candidates=advanced.get("whispercpp_language_candidates", ""),
+            whispercpp_n_threads=advanced.get("whispercpp_n_threads", 0),
+            whispercpp_gpu_device=advanced.get("whispercpp_gpu_device", None),
+            remote_api_url=saved.get("remote_api_url", ""),
+            remote_api_key=saved.get("remote_api_key", ""),
+            remote_api_endpoint=saved.get("remote_api_endpoint", "/inference"),
+            remote_api_model=saved.get("remote_api_model", "whisper-1"),
+            playback_duck=_NoDuck(),
+        )
+        if not manager.model_ready:
+            print("vocalinux: the speech model is not downloaded", file=sys.stderr)
+            return 1
+        text = manager.transcribe_file(path)
+    except Exception as error:
+        logger.exception("Transcription of %s failed", path)
+        print(
+            f"vocalinux: could not transcribe {path}: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(text if text else "vocalinux: no speech detected")
+    return 0
+
+
+class _NoDuck:
+    """Playback duck stand-in for headless runs that never open the microphone."""
+
+    def restore(self) -> None:
+        return None
 
 
 def check_dependencies():
@@ -346,6 +415,11 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
 
+    # Persistent log file, always on; detail goes to the file, not the console.
+    log_path = setup_file_logging()
+    if log_path:
+        logger.info("Logging to %s", log_path)
+
     # External activation: forward the command to a running instance over D-Bus
     # and exit without acquiring the lock or starting a second full instance.
     trigger = _selected_trigger(args)
@@ -356,6 +430,9 @@ def main():
     # it works alongside a running tray app and on a displayless shell.
     if isinstance(args.transcribe_file, str):
         sys.exit(_run_file_transcription(args.transcribe_file))
+
+    if isinstance(args.transcribe, str):
+        sys.exit(_run_recording_transcription(args.transcribe, args))
 
     # Check for single instance BEFORE any initialization
     from . import single_instance
@@ -529,6 +606,11 @@ def main():
     vad_sensitivity = saved_settings.get("vad_sensitivity", 3)
     silence_timeout = saved_settings.get("silence_timeout", 2.0)
     stop_sound_guard_ms = saved_settings.get("stop_sound_guard_ms", 200)
+    max_recording_minutes = saved_settings.get("max_recording_minutes", 30)
+    chunk_min_seconds = saved_settings.get("chunk_min_seconds", 20)
+    chunk_max_seconds = saved_settings.get("chunk_max_seconds", 120)
+    save_recordings = saved_settings.get("save_recordings", True)
+    recordings_retention_hours = saved_settings.get("recordings_retention_hours", 24)
     voice_commands_enabled = saved_settings.get("voice_commands_enabled")  # None = auto
     audio_device_index = audio_settings.get("device_index", None)
     audio_device_name = audio_settings.get("device_name", None)
@@ -573,6 +655,11 @@ def main():
             vad_sensitivity=vad_sensitivity,
             silence_timeout=silence_timeout,
             stop_sound_guard_ms=stop_sound_guard_ms,
+            max_recording_minutes=max_recording_minutes,
+            chunk_min_seconds=chunk_min_seconds,
+            chunk_max_seconds=chunk_max_seconds,
+            save_recordings=save_recordings,
+            recordings_retention_hours=recordings_retention_hours,
             buffer_during_reload=config_manager.get_bool(
                 "model_keepalive", "buffer_during_reload", False
             ),
@@ -598,6 +685,13 @@ def main():
             remote_api_endpoint=saved_settings.get("remote_api_endpoint", "/inference"),
             remote_api_model=saved_settings.get("remote_api_model", "whisper-1"),
         )
+
+        # Delete old dictation recordings; the manager repeats this daily.
+        threading.Thread(
+            target=speech_engine.cleanup_recordings,
+            name="vocalinux-recordings-cleanup",
+            daemon=True,
+        ).start()
 
         # Initialize text injection system
         text_system = text_injector.TextInjector(wayland_mode=args.wayland)
@@ -901,6 +995,12 @@ def main():
                 success = True
             else:
                 success = text_system.inject_text(text_to_inject)
+                logger.info(
+                    "[%s] Injection %s chars=%d",
+                    getattr(speech_engine, "last_session_id", ""),
+                    "succeeded" if success else "failed",
+                    len(text_to_inject),
+                )
             if success:
                 action_handler.set_last_injected_text(text_to_inject)
                 last_injected["to_pad"] = captured

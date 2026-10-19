@@ -128,6 +128,16 @@ DEFAULT_CONFIG = {
         "vad_sensitivity": 3,  # Voice Activity Detection sensitivity (1-5)
         "silence_timeout": 2.0,  # Seconds of silence before stopping
         "stop_sound_guard_ms": 200,  # Small tail trim to avoid the stop sound without clipping speech
+        # Stop a dictation after this many minutes of audio; 0 = no limit. All audio is kept.
+        "max_recording_minutes": 30,
+        # Push-to-talk: send a long dictation to the engine in chunks. A chunk ends at the
+        # first pause after chunk_min_seconds, or at chunk_max_seconds without a pause.
+        "chunk_min_seconds": 20,
+        "chunk_max_seconds": 120,
+        # Keep each dictation as WAV + JSON in $XDG_CACHE_HOME/vocalinux/recordings
+        # for recovery, and delete files older than recordings_retention_hours.
+        "save_recordings": True,
+        "recordings_retention_hours": 24,
         "voice_commands_enabled": None,  # None = auto (enabled for VOSK, disabled for Whisper)
         "remote_api_url": "",  # Remote speech recognition server URL (e.g. http://192.168.1.100:8080)
         "remote_api_key": "",  # Remote server API key (optional)

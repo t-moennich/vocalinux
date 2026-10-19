@@ -80,6 +80,15 @@ from ..utils.whispercpp_model_info import (
 )
 from ..version import __version__
 from .command_processor import CommandProcessor
+from .recordings import (
+    SAMPLE_RATE,
+    DictationSession,
+    SegmentQueue,
+    cleanup_old_recordings,
+    queue_session,
+    save_session_audio,
+    write_sidecar,
+)
 from .silero_vad import SILERO_CHUNK_SIZE, load_silero_vad
 
 if TYPE_CHECKING:
@@ -101,9 +110,17 @@ class _AudioSegment(list):
         chunks: list[bytes],
         started_at: Optional[float],
         language: Optional[str] = None,
+        partial: bool = False,
+        session: Optional[DictationSession] = None,
     ) -> None:
         super().__init__(chunks)
         self.started_at = started_at
+        # True for an intermediate chunk of a long push-to-talk session: its
+        # text is held until the session's final segment is transcribed.
+        self.partial = partial
+        self.session = session
+        # Stat entry of the session's segment list, filled in by the worker.
+        self.stat: Optional[dict] = None
         # The language this utterance was dictated under (#805): a worker that
         # outlives its session must not transcribe a stale segment in a newer
         # session's language.
@@ -280,6 +297,9 @@ def _show_notification(title: str, message: str, icon: str = "dialog-warning"):
 # Define constants
 MODELS_DIR = models_dir()
 
+#: Level below DEBUG for per-chunk noise that the log file should not hold.
+LOG_LEVEL_TRACE = 5
+
 
 def _get_system_model_paths() -> list:
     """
@@ -404,6 +424,11 @@ class SpeechRecognitionManager:
         # change a queued segment's language (#805).
         self._session_language: Optional[str] = None
         self.stop_sound_guard_ms = kwargs.get("stop_sound_guard_ms", 200)
+        self.max_recording_minutes = kwargs.get("max_recording_minutes", 30)
+        self.chunk_min_seconds = kwargs.get("chunk_min_seconds", 20)
+        self.chunk_max_seconds = kwargs.get("chunk_max_seconds", 120)
+        self.save_recordings = kwargs.get("save_recordings", True)
+        self.recordings_retention_hours = kwargs.get("recordings_retention_hours", 24)
         self.dictionary_manager: Optional["CustomDictionaryManager"] = kwargs.get(
             "dictionary_manager"
         )
@@ -512,10 +537,13 @@ class SpeechRecognitionManager:
         self._recording_segment_has_speech = False
         self._buffer_lock = threading.Lock()  # Thread safety for audio_buffer
         self._model_lock = threading.Lock()  # Thread safety for model/recognizer access
-        self._segment_queue = queue.Queue(maxsize=32)
+        self._session = DictationSession(keep_audio=False)
+        self._segment_queue = SegmentQueue(self._session)
 
         # Reliability improvements - Issue #92
-        self._max_buffer_size = 5000  # Maximum number of audio chunks in buffer
+        # Chunk limit while a model reloads; a normal session is limited by
+        # max_recording_minutes instead and never trims audio.
+        self._max_buffer_size = 5000
         self._reconnection_attempts = 0
         self._max_reconnection_attempts = 5
         self._reconnection_delay = 1.0  # Initial delay in seconds
@@ -611,6 +639,17 @@ class SpeechRecognitionManager:
     _pending_language_override: Optional[str] = None
     _oneshot_language_restore: Optional[str] = None
     _session_language: Optional[str] = None
+
+    #: Class-level defaults for managers built without ``__init__``.
+    max_recording_minutes: float = 30
+    chunk_min_seconds: float = 20
+    chunk_max_seconds: float = 120
+    save_recordings: bool = True
+    recordings_retention_hours: float = 24
+    _session: Optional[DictationSession] = None
+    _last_recordings_cleanup: float = 0.0
+    last_session_id: str = ""
+    _file_vad_carry: Optional["np.ndarray"] = None
 
     #: Logged once rather than per dictation, so an unsupported pairing does not
     #: spam the log on every hotkey press.
@@ -3157,16 +3196,34 @@ class SpeechRecognitionManager:
         self._recognition_mode = mode
         self.audio_buffer = []
         self._segment_started_at = None
-        self._segment_queue = queue.Queue(maxsize=32)
+        self._session = DictationSession(
+            mode=mode,
+            engine=getattr(self, "engine", ""),
+            model=getattr(self, "model_size", ""),
+            language=self.language,
+            device_name=getattr(self, "audio_device_name", None),
+            keep_audio=bool(self.save_recordings),
+        )
+        self._segment_queue = SegmentQueue(self._session)
+        self._session.log(
+            logging.INFO,
+            "Session started mode=%s engine=%s model=%s language=%s device=%s",
+            mode,
+            getattr(self, "engine", ""),
+            getattr(self, "model_size", ""),
+            self.language,
+            getattr(self, "audio_device_name", None) or "default",
+        )
 
         # Start the audio recording thread
         self.audio_thread = threading.Thread(target=self._record_audio)
         self.audio_thread.daemon = True
         self.audio_thread.start()
 
-        # Start the recognition thread
+        # Start the recognition thread. It reads only this session's queue,
+        # so a worker that outlives the session never touches the next one.
         target = self._reload_and_recognize if reload_in_background else self._perform_recognition
-        self.recognition_thread = threading.Thread(target=target)
+        self.recognition_thread = threading.Thread(target=target, args=(self._segment_queue,))
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
         # After the threads exist: a start that returned early must not duck.
@@ -3225,6 +3282,9 @@ class SpeechRecognitionManager:
                 self.audio_buffer = []
             self._recording_segment_has_speech = False
 
+        session = self._get_session()
+        self._finalize_session(session, self.recognition_thread)
+
         if getattr(self, "_buffered_reload_session", False):
             # Keep the session busy until its queued audio has been transcribed.
             # In particular, key release must not wait for a cold model load.
@@ -3246,8 +3306,67 @@ class SpeechRecognitionManager:
         self._recognition_mode = "toggle"
         self._update_state(RecognitionState.IDLE)
 
-    def _reload_and_recognize(self) -> None:
+    def _get_session(self) -> DictationSession:
+        """Return the current session, creating an idle one for bare managers."""
+        if self._session is None:
+            self._session = DictationSession(keep_audio=False)
+        return self._session
+
+    def _finalize_session(self, session: DictationSession, worker: Optional[threading.Thread]):
+        """Save the session recording off the audio thread and write its sidecar."""
+        if session.stopped_wall is not None:
+            return
+        session.stopped_wall = time.time()
+        session.log(
+            logging.INFO,
+            "Session stopped audio=%.1fs segments=%d limit_hit=%s",
+            session.audio_seconds,
+            len(session.segments),
+            session.limit_hit,
+        )
+        if not session.keep_audio:
+            return
+
+        def run() -> None:
+            try:
+                path = save_session_audio(session)
+                if path is None:
+                    return
+                session.log(
+                    logging.INFO,
+                    "Recording saved path=%s duration=%.1fs",
+                    path,
+                    session.audio_seconds,
+                )
+                session.chunks = []
+                write_sidecar(session)
+                # The worker may still be transcribing; write the sidecar again
+                # with its timings once it is done.
+                if worker is not None and worker is not threading.current_thread():
+                    worker.join()
+                    write_sidecar(session)
+                self.cleanup_recordings(force=False)
+            except Exception:
+                session.log(logging.ERROR, "Could not save the recording", exc_info=True)
+
+        threading.Thread(target=run, name="vocalinux-save-recording", daemon=True).start()
+
+    def cleanup_recordings(self, force: bool = True) -> int:
+        """Delete recordings older than the retention; at most once a day unless forced."""
+        now = time.time()
+        if not force and now - self._last_recordings_cleanup < 24 * 3600:
+            return 0
+        self._last_recordings_cleanup = now
+        try:
+            return cleanup_old_recordings(self.recordings_retention_hours)
+        except Exception:
+            logger.error("Recording cleanup failed", exc_info=True)
+            return 0
+
+    def _reload_and_recognize(self, segment_queue: Optional[queue.Queue] = None) -> None:
         """Reload an idle model while the recording thread captures speech."""
+        if segment_queue is None:
+            segment_queue = self._segment_queue
         try:
             # Idle unload already released the engine resources. Resume reinit
             # cannot be used here because it stops the active microphone.
@@ -3261,7 +3380,7 @@ class SpeechRecognitionManager:
             if self._buffered_capture_failed or self.state == RecognitionState.ERROR:
                 raise RuntimeError("Audio capture failed during model reload")
             if not self._cancel_buffered_session.is_set():
-                self._perform_recognition()
+                self._perform_recognition(segment_queue)
         except (ChecksumError, ImportError, OSError, RuntimeError, ValueError):
             logger.exception("Failed to reload model or transcribe buffered speech")
             play_error_sound()
@@ -3288,10 +3407,12 @@ class SpeechRecognitionManager:
                 and not self._buffered_capture_failed
                 and not self._cancel_buffered_session.is_set()
             ):
-                self._transcribe_queued_segments()
+                self._transcribe_queued_segments(segment_queue)
             with self._buffer_lock:
                 self.audio_buffer = []
-            self._segment_queue = queue.Queue(maxsize=32)
+            # Replace the queue only if no newer session has set its own.
+            if self._segment_queue is segment_queue:
+                self._segment_queue = SegmentQueue(queue_session(segment_queue))
             self._recognition_mode = "toggle"
             self._buffered_reload_session = False
             # The notification above reports the failed attempt. Return to IDLE
@@ -3354,6 +3475,46 @@ class SpeechRecognitionManager:
             # The override only ever feeds the next start attempt, whether it
             # ran or was refused by the guards inside start_recognition.
             self._pending_language_override = None
+
+    def _can_split_segment(self) -> bool:
+        """Whether the current speech may be sent on as an intermediate chunk.
+
+        Only push-to-talk keeps a whole dictation in one buffer, so only it
+        needs chunks. A session that waits for a model reload keeps its audio
+        together until the load is done.
+        """
+        return (
+            self._recognition_mode == "push_to_talk"
+            and not getattr(self, "_reload_pending", False)
+            and self.chunk_min_seconds > 0
+        )
+
+    def _recording_limit_reached(self, session: DictationSession) -> bool:
+        """Whether the session captured max_recording_minutes of audio."""
+        try:
+            limit_minutes = float(self.max_recording_minutes)
+        except (TypeError, ValueError):
+            return False
+        return limit_minutes > 0 and session.samples >= limit_minutes * 60 * SAMPLE_RATE
+
+    def _handle_recording_limit(self, session: DictationSession) -> None:
+        """Stop the session normally once the duration limit is reached."""
+        session.limit_hit = True
+        minutes = float(self.max_recording_minutes)
+        session.log(
+            logging.WARNING,
+            "Recording limit of %g minutes reached, stopping the session",
+            minutes,
+        )
+        _show_notification(
+            "Recording Limit Reached",
+            f"Dictation stopped after {minutes:g} minutes. Your speech is being transcribed.",
+            "dialog-information",
+        )
+        # stop_recognition joins the audio thread, so it must not run on it.
+        threading.Thread(
+            target=self.stop_recognition, name="vocalinux-recording-limit", daemon=True
+        ).start()
 
     def _record_audio(self):
         """Record audio from the microphone with reconnection logic."""
@@ -3432,7 +3593,16 @@ class SpeechRecognitionManager:
 
             self._sync_capture_state()
 
-            logger.info("Audio recording started")
+            session = self._get_session()
+            session.capture_sample_rate = self._capture_sample_rate
+            session.capture_channels = self._capture_channels
+            session.log(
+                logging.INFO,
+                "Audio recording started device=%s capture_rate=%s channels=%s",
+                getattr(self, "audio_device_name", None) or "default",
+                self._capture_sample_rate,
+                self._capture_channels,
+            )
 
             # Record audio while should_record is True
             silence_counter = 0
@@ -3441,6 +3611,8 @@ class SpeechRecognitionManager:
             log_level_interval = 0  # Counter for periodic level logging
             max_level_seen = 0.0
             capture_failed = False
+            # 16 kHz samples in the current buffer, for the chunk split rules.
+            segment_samples = 0
             # Accumulator for 512-sample Silero chunks.  When the capture rate
             # is higher than 16 kHz (e.g. 48 kHz), resampling produces fewer
             # than 1024 samples per read (~341 at 48 kHz), so the buffer may
@@ -3455,18 +3627,15 @@ class SpeechRecognitionManager:
 
             while self.should_record:
                 try:
-                    # Check buffer size and enforce limits (with lock for thread safety)
                     with self._buffer_lock:
-                        if len(self.audio_buffer) >= self._max_buffer_size:
-                            if getattr(self, "_reload_pending", False):
-                                raise RuntimeError("Audio buffer filled while reloading the model")
-                            logger.warning(
-                                f"Audio buffer limit reached ({len(self.audio_buffer)} chunks). Clearing oldest data."
-                            )
-                            # Remove oldest 25% of data to prevent memory issues
-                            remove_count = self._max_buffer_size // 4
-                            self.audio_buffer = self.audio_buffer[remove_count:]
-                            logger.info(f"Buffer trimmed by {remove_count} chunks")
+                        # A stalled model load must fail instead of growing
+                        # the buffer. Normal sessions never trim audio; they
+                        # stop at max_recording_minutes.
+                        if (
+                            getattr(self, "_reload_pending", False)
+                            and len(self.audio_buffer) >= self._max_buffer_size
+                        ):
+                            raise RuntimeError("Audio buffer filled while reloading the model")
 
                         data = source.read_chunk()
 
@@ -3476,7 +3645,13 @@ class SpeechRecognitionManager:
                             # compares against this to separate speech
                             # captured before it from speech captured after.
                             self._segment_started_at = time.monotonic()
+                            segment_samples = 0
                         self.audio_buffer.append(data)
+                        session.add_chunk(data)
+                        segment_samples += len(data) // 2
+
+                    if not session.limit_hit and self._recording_limit_reached(session):
+                        self._handle_recording_limit(session)
 
                     # Voice Activity Detection (VAD)
                     audio_data = np.frombuffer(data, dtype=np.int16)
@@ -3498,8 +3673,10 @@ class SpeechRecognitionManager:
                     # Log audio levels periodically for debugging
                     log_level_interval += 1
                     if log_level_interval >= 50:  # Every ~3 seconds at 16kHz/1024 chunks
-                        logger.debug(
-                            f"Audio level: current={normalized_level:.1f}%, max_seen={max_level_seen:.1f}%, buffer_size={len(self.audio_buffer)}"
+                        # Below DEBUG so the persistent log file stays free of it.
+                        logger.log(
+                            LOG_LEVEL_TRACE,
+                            f"Audio level: current={normalized_level:.1f}%, max_seen={max_level_seen:.1f}%, buffer_size={len(self.audio_buffer)}",
                         )
                         log_level_interval = 0
 
@@ -3550,6 +3727,17 @@ class SpeechRecognitionManager:
                                         "Silence detected with no speech, dropping audio buffer"
                                     )
                                     self.audio_buffer = []
+                                elif self._can_split_segment() and (
+                                    segment_samples >= self.chunk_min_seconds * SAMPLE_RATE
+                                ):
+                                    session.log(
+                                        logging.INFO,
+                                        "Pause after %.1fs of speech, " "splitting a chunk",
+                                        segment_samples / SAMPLE_RATE,
+                                    )
+                                    self._enqueue_audio_segment(self.audio_buffer, partial=True)
+                                    self.audio_buffer = []
+                                    self._recording_segment_has_speech = False
                                 elif self._recognition_mode == "push_to_talk" or getattr(
                                     self, "_reload_pending", False
                                 ):
@@ -3577,6 +3765,22 @@ class SpeechRecognitionManager:
                                 )
                             speech_detected_in_session = True
                         silence_counter = 0
+
+                    # No pause arrived: split a chunk that grew too long.
+                    if (
+                        self.audio_buffer
+                        and self._recording_segment_has_speech
+                        and self._can_split_segment()
+                        and segment_samples >= self.chunk_max_seconds * SAMPLE_RATE
+                    ):
+                        session.log(
+                            logging.INFO,
+                            "No pause in %.1fs of speech, forcing a chunk split",
+                            segment_samples / SAMPLE_RATE,
+                        )
+                        self._enqueue_audio_segment(self.audio_buffer, partial=True)
+                        self.audio_buffer = []
+                        self._recording_segment_has_speech = False
                 except (IOError, OSError) as e:
                     current_time = time.time()
                     logger.error(f"Audio device error: {e}")
@@ -3671,11 +3875,58 @@ class SpeechRecognitionManager:
         ``language`` is the per-utterance snapshot stamped on the segment when
         it was queued (#805); None falls back to the segment's own stamp and
         then to the live session language.
+
+        An intermediate chunk (``partial``) only stores its text in its
+        session. The session's final segment joins the stored parts with its
+        own text and runs the post-processing once on the result.
         """
         if not audio_buffer:
             return
         if language is None:
             language = getattr(audio_buffer, "language", None)
+        session = getattr(audio_buffer, "session", None)
+        stat = getattr(audio_buffer, "stat", None)
+        partial = bool(getattr(audio_buffer, "partial", False))
+        started_at = getattr(audio_buffer, "started_at", None)
+
+        transcribe_start = time.perf_counter()
+        text = self._transcribe_segment(audio_buffer, language)
+        took = time.perf_counter() - transcribe_start
+        if text is None:
+            return
+
+        if session is not None:
+            audio_seconds = (stat or {}).get("audio_seconds") or 0.0
+            if stat is not None:
+                stat["transcribe_seconds"] = round(took, 2)
+                stat["chars"] = len(text)
+            session.log(
+                logging.INFO,
+                "Chunk transcribed partial=%s audio=%.1fs took=%.1fs rtf=%.2f chars=%d",
+                partial,
+                audio_seconds,
+                took,
+                took / audio_seconds if audio_seconds else 0.0,
+                len(text),
+            )
+            if partial:
+                session.add_text_part(text, started_at)
+                return
+            text, first_started_at = session.take_text(text)
+            if first_started_at is not None:
+                started_at = first_started_at
+            session.final_text_chars = (session.final_text_chars or 0) + len(text)
+            session.log(logging.INFO, "Final text joined chars=%d", len(text))
+
+        self._emit_text(text, started_at, session)
+
+    def _transcribe_segment(
+        self, audio_buffer: list[bytes], language: Optional[str] = None
+    ) -> Optional[str]:
+        """Transcribe a segment with the active engine.
+
+        Returns None when the engine is not usable, so nothing is emitted.
+        """
         dictation_language = self._dictation_language(language)
 
         if self.engine == "vosk":
@@ -3684,7 +3935,7 @@ class SpeechRecognitionManager:
                 # Check if recognizer is still valid
                 if self.recognizer is None:
                     logger.warning("Recognizer is None during processing, returning empty result")
-                    return
+                    return None
                 for data in audio_buffer:
                     self.recognizer.AcceptWaveform(data)
 
@@ -3714,88 +3965,214 @@ class SpeechRecognitionManager:
                 session = self._http_session
             if session is None:
                 logger.error("Remote API HTTP session not initialized")
-                return
+                return None
             text = self._transcribe_with_remote_api(audio_buffer, session, dictation_language)
 
         else:
             logger.error(f"Unknown engine: {self.engine}")
+            return None
+
+        return text
+
+    def _flush_session_text(self, session: DictationSession) -> None:
+        """Emit text held for a session whose final segment never arrived.
+
+        A session can end with a silent tail that is dropped, leaving only
+        intermediate chunks; their text must still be delivered once.
+        """
+        if not session.has_text_parts():
+            return
+        try:
+            text, started_at = session.take_text("")
+            session.final_text_chars = (session.final_text_chars or 0) + len(text)
+            session.log(logging.INFO, "Final text joined chars=%d (no final segment)", len(text))
+            self._emit_text(text, started_at, session)
+        except Exception:
+            session.log(logging.ERROR, "Could not emit the held text", exc_info=True)
+
+    def _postprocess_text(self, text: str) -> tuple[str, list[str]]:
+        """Apply dictionary corrections and voice commands to a transcription."""
+        # Corrections must precede command parsing: a safe replacement can
+        # stop a model mishearing from triggering a destructive action.
+        text = self._apply_dictionary_corrections(text)
+        if self._voice_commands_enabled:
+            # Process with voice commands (original behavior)
+            return self.command_processor.process_text(text)
+        # Voice commands disabled - pass text through directly (Whisper handles punctuation)
+        return text.strip(), []
+
+    def _speech_decision(self, step: "np.ndarray") -> Optional[bool]:
+        """Speech decision for one step of a file, with the live loop's thresholds."""
+        import numpy as np
+
+        try:
+            vad_sens = max(1, min(5, int(self.vad_sensitivity)))
+        except ValueError:
+            vad_sens = 3
+        if self._silero_vad is None:
+            return bool(float(np.abs(step).mean()) >= 500 / vad_sens)
+
+        # Silero takes 512-sample blocks; keep the remainder for the next step.
+        carry = self._file_vad_carry
+        carry = np.concatenate([carry, step]) if carry is not None and len(carry) else step
+        probability = None
+        while len(carry) >= SILERO_CHUNK_SIZE:
+            block, carry = carry[:SILERO_CHUNK_SIZE], carry[SILERO_CHUNK_SIZE:]
+            probability = max(probability or 0.0, self._silero_vad.process(block))
+        self._file_vad_carry = carry
+        if probability is None:
+            return None
+        return bool(probability >= 0.8 - (vad_sens - 1) * 0.125)
+
+    def transcribe_file(self, path: str) -> str:
+        """Transcribe an audio file the way a push-to-talk dictation would.
+
+        The file is split at pauses (chunk_min_seconds, chunk_max_seconds), each
+        chunk is transcribed and the texts are joined and post-processed once.
+        Nothing is injected; the text is returned.
+        """
+        import numpy as np
+
+        from .chunking import split_like_dictation
+        from .diarization import load_audio
+
+        audio = load_audio(path)
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        if self._silero_vad is not None:
+            self._silero_vad.reset()
+        self._file_vad_carry = np.array([], dtype=np.int16)
+        chunks = split_like_dictation(
+            pcm,
+            self._speech_decision,
+            self.silence_timeout,
+            self.chunk_min_seconds,
+            self.chunk_max_seconds,
+        )
+
+        session = DictationSession(
+            mode="push_to_talk",
+            engine=self.engine,
+            model=self.model_size,
+            language=self.language,
+            keep_audio=False,
+        )
+        session.log(
+            logging.INFO,
+            "Transcribing file %s audio=%.1fs chunks=%d",
+            path,
+            len(pcm) / SAMPLE_RATE,
+            len(chunks),
+        )
+        for index, chunk in enumerate(chunks, start=1):
+            start = time.perf_counter()
+            text = self._transcribe_segment([chunk.tobytes()], None)
+            took = time.perf_counter() - start
+            seconds = len(chunk) / SAMPLE_RATE
+            session.log(
+                logging.INFO,
+                "Chunk %d/%d transcribed audio=%.1fs took=%.1fs rtf=%.2f chars=%d",
+                index,
+                len(chunks),
+                seconds,
+                took,
+                took / seconds if seconds else 0.0,
+                len(text or ""),
+            )
+            session.add_text_part(text or "", None)
+        joined, _ = session.take_text("")
+        processed, _actions = self._postprocess_text(joined) if joined else ("", [])
+        session.log(logging.INFO, "Final text chars=%d", len(processed))
+        return processed
+
+    def _emit_text(
+        self, text: str, started_at: Optional[float], session: Optional[DictationSession] = None
+    ) -> None:
+        """Post-process ``text`` and hand it to the segment, text and action callbacks."""
+        logger.debug(f"_emit_text got text='{text[:50] if text else '(empty)'}...'")
+        if not text:
             return
 
-        # Process text - either with voice commands or pass through directly
-        logger.debug(f"_process_audio_buffer got text='{text[:50] if text else '(empty)'}...'")
-        if text:
-            # Corrections must precede command parsing: a safe replacement can
-            # stop a model mishearing from triggering a destructive action.
-            text = self._apply_dictionary_corrections(text)
-            if self._voice_commands_enabled:
-                # Process with voice commands (original behavior)
-                processed_text, actions = self.command_processor.process_text(text)
-            else:
-                # Voice commands disabled - pass text through directly (Whisper handles punctuation)
-                processed_text = text.strip()
-                actions = []
+        processed_text, actions = self._postprocess_text(text)
 
-            # Call text callbacks with processed text
-            logger.debug(
-                f"processed_text='{processed_text[:50] if processed_text else '(empty)'}...', callbacks={len(self.text_callbacks)}"
-            )
-            if processed_text:
-                started_at = getattr(audio_buffer, "started_at", None)
-                if started_at is None:
-                    started_at = time.monotonic()
-                for segment_callback in self.segment_callbacks:
-                    segment_callback(processed_text, started_at)
-                for callback in self.text_callbacks:
-                    logger.debug(
-                        f"invoking text callback: {callback.__name__ if hasattr(callback, '__name__') else callback}"
-                    )
-                    callback(processed_text)
+        # Call text callbacks with processed text
+        logger.debug(
+            f"processed_text='{processed_text[:50] if processed_text else '(empty)'}...', callbacks={len(self.text_callbacks)}"
+        )
+        if processed_text:
+            if started_at is None:
+                started_at = time.monotonic()
+            if session is not None:
+                self.last_session_id = session.id
+                session.log(
+                    logging.INFO,
+                    "Emitting text chars=%d to %d callbacks",
+                    len(processed_text),
+                    len(self.text_callbacks),
+                )
+            for segment_callback in self.segment_callbacks:
+                segment_callback(processed_text, started_at)
+            for callback in self.text_callbacks:
+                logger.debug(
+                    f"invoking text callback: {callback.__name__ if hasattr(callback, '__name__') else callback}"
+                )
+                callback(processed_text)
 
-            # Call action callbacks for each action
-            for action in actions:
-                for callback in self.action_callbacks:
-                    callback(action)
+        # Call action callbacks for each action
+        for action in actions:
+            for callback in self.action_callbacks:
+                callback(action)
 
-    def _perform_recognition(self):
-        """Perform speech recognition in real-time."""
+    def _perform_recognition(self, segment_queue: Optional[queue.Queue] = None):
+        """Perform speech recognition in real-time.
+
+        ``segment_queue`` is the queue of the session this worker serves. It is
+        bound once at the start, so a worker that outlives its session never
+        reads segments of a newer one.
+        """
+        if segment_queue is None:
+            segment_queue = self._segment_queue
+        session = queue_session(segment_queue)
         logger.debug("_perform_recognition thread started")
         try:
             while True:
-                logger.debug(
-                    f"Recognition loop - should_record={self.should_record}, queue_empty={self._segment_queue.empty()}"
+                logger.log(
+                    LOG_LEVEL_TRACE,
+                    f"Recognition loop - should_record={self.should_record}, queue_empty={segment_queue.empty()}",
                 )
                 try:
-                    queued = self._segment_queue.get(timeout=0.1)
+                    queued = segment_queue.get(timeout=0.1)
                 except queue.Empty:
                     # Only exit if we're not recording AND queue is empty
-                    if not self.should_record and self._segment_queue.empty():
+                    if not self.should_record and segment_queue.empty():
                         logger.debug(
                             "Recognition loop - not recording and queue empty, checking for final items..."
                         )
                         # Give a brief moment for any final items to be enqueued
                         try:
-                            queued = self._segment_queue.get(timeout=0.5)
+                            queued = segment_queue.get(timeout=0.5)
                         except queue.Empty:
                             logger.debug("Recognition loop - no more items, exiting")
                             break
                     else:
-                        logger.debug("Recognition loop - queue timeout, continuing")
+                        logger.log(LOG_LEVEL_TRACE, "Recognition loop - queue timeout, continuing")
                         continue
 
                 if queued is None:
                     logger.debug("Recognition loop - got None signal, draining remaining items...")
                     # Drain any remaining items before exiting
-                    while not self._segment_queue.empty():
+                    while not segment_queue.empty():
                         try:
-                            remaining = self._segment_queue.get_nowait()
+                            remaining = segment_queue.get_nowait()
                             if remaining is not None:
                                 remaining_segment, remaining_language = remaining
                                 logger.debug(
                                     f"Recognition loop - processing remaining segment with {len(remaining_segment)} chunks"
                                 )
-                                if self.should_record:
+                                if self.should_record and self._segment_queue is segment_queue:
                                     self._update_state(RecognitionState.PROCESSING)
-                                self._process_audio_buffer(remaining_segment, remaining_language)
+                                self._process_queued_segment(
+                                    session, remaining_segment, remaining_language
+                                )
                         except queue.Empty:
                             break
                     logger.debug("Recognition loop - exiting after None signal")
@@ -3803,57 +4180,69 @@ class SpeechRecognitionManager:
 
                 segment, segment_language = queued
                 logger.debug(f"Recognition loop - processing segment with {len(segment)} chunks")
-                if self.should_record:
+                current = self._segment_queue is segment_queue
+                if self.should_record and current:
                     self._update_state(RecognitionState.PROCESSING)
-                self._process_audio_buffer(segment, segment_language)
-                if self.should_record:
+                self._process_queued_segment(session, segment, segment_language)
+                if self.should_record and current:
                     self._update_state(RecognitionState.LISTENING)
         finally:
             logger.debug("_perform_recognition thread exiting")
+            self._flush_session_text(session)
             # Do not force IDLE here. stop_recognition() already does that,
             # and a leftover worker can finish after the user has started
             # again (LISTENING, should_record still false during the start
             # sound). Forcing IDLE would paint the tray idle and make the
             # next Alt+F12 start a second session (#739).
 
-    def _enqueue_audio_segment(self, audio_buffer: list[bytes]):
-        """Queue an audio segment for asynchronous transcription."""
-        segment = _AudioSegment(audio_buffer.copy(), self._segment_started_at)
+    def _process_queued_segment(
+        self, session: DictationSession, segment: list[bytes], language: Optional[str]
+    ) -> None:
+        """Transcribe one queued segment; a failure loses that segment, not the session."""
+        try:
+            self._process_audio_buffer(segment, language)
+        except Exception as error:
+            session.add_error(f"{type(error).__name__}: {error}")
+            session.log(logging.ERROR, "Transcription of a segment failed", exc_info=True)
+
+    def _enqueue_audio_segment(self, audio_buffer: list[bytes], partial: bool = False):
+        """Queue an audio segment for asynchronous transcription.
+
+        ``partial`` marks an intermediate chunk of a long session: its text is
+        held until the session's final segment is transcribed.
+        """
+        session = queue_session(self._segment_queue)
+        segment = _AudioSegment(
+            audio_buffer.copy(), self._segment_started_at, partial=partial, session=session
+        )
         if not segment:
             logger.warning("_enqueue_audio_segment called with empty buffer")
             return
 
         logger.debug(f"_enqueue_audio_segment called with {len(segment)} chunks")
+        audio_seconds = sum(len(chunk) for chunk in segment) / 2 / SAMPLE_RATE
+        segment.stat = session.add_segment(audio_seconds, partial)
 
         # Stamp this utterance's language on the segment: a worker that
         # outlives its dictation (or drains another session's queue) must
         # transcribe each segment in the language it was recorded under, not
         # whatever a newer session stored in _session_language (#805).
         segment.language = self._dictation_language()
-        stamped = (segment, segment.language)
-        try:
-            self._segment_queue.put_nowait(stamped)
-            logger.debug("Enqueued segment successfully")
-        except queue.Full:
-            logger.warning("Transcription queue is full, dropping oldest pending segment")
-            try:
-                self._segment_queue.get_nowait()
-                self._segment_queue.put_nowait(stamped)
-            except queue.Empty:
-                logger.warning("Could not recover queue space for transcription segment")
+        # The queue is unbounded: a segment is never dropped.
+        self._segment_queue.put((segment, segment.language))
+        session.log(
+            logging.INFO,
+            "Segment %d enqueued partial=%s audio=%.1fs",
+            segment.stat["index"],
+            partial,
+            audio_seconds,
+        )
 
     def _signal_recognition_stop(self):
         """Signal recognition thread to wake up and stop cleanly."""
-        try:
-            self._segment_queue.put_nowait(None)
-        except queue.Full:
-            try:
-                self._segment_queue.get_nowait()
-                self._segment_queue.put_nowait(None)
-            except queue.Empty:
-                logger.debug("Recognition queue emptied before stop signal")
+        self._segment_queue.put(None)
 
-    def _transcribe_queued_segments(self) -> None:
+    def _transcribe_queued_segments(self, segment_queue: Optional[queue.Queue] = None) -> None:
         """Transcribe audio segments still queued after the worker exited.
 
         Runs on the reload thread once key release has finished its handoff,
@@ -3861,21 +4250,27 @@ class SpeechRecognitionManager:
         key's tail buffer queued during its bounded join — are still
         transcribed instead of being thrown away with the queue.
         """
-        while True:
-            try:
-                queued = self._segment_queue.get_nowait()
-            except queue.Empty:
-                return
-            if queued is None:
-                continue
-            # Queue items are (segment, language) tuples stamped at enqueue
-            # time — the language must reach the decoder or the buffer is
-            # transcribed under the wrong language.
-            segment, segment_language = queued
-            try:
-                self._process_audio_buffer(segment, segment_language)
-            except (ChecksumError, ImportError, OSError, RuntimeError, ValueError):
-                logger.exception("Failed to transcribe a leftover buffered segment")
+        if segment_queue is None:
+            segment_queue = self._segment_queue
+        session = queue_session(segment_queue)
+        try:
+            while True:
+                try:
+                    queued = segment_queue.get_nowait()
+                except queue.Empty:
+                    return
+                if queued is None:
+                    continue
+                # Queue items are (segment, language) tuples stamped at enqueue
+                # time - the language must reach the decoder or the buffer is
+                # transcribed under the wrong language.
+                segment, segment_language = queued
+                try:
+                    self._process_audio_buffer(segment, segment_language)
+                except (ChecksumError, ImportError, OSError, RuntimeError, ValueError):
+                    logger.exception("Failed to transcribe a leftover buffered segment")
+        finally:
+            self._flush_session_text(session)
 
     def reconfigure(
         self,

@@ -70,7 +70,9 @@ class LoggingManager:
 
         # Set up custom log handler
         self.handler = LoggingHandler(self)
-        self.handler.setLevel(logging.DEBUG)
+        # Same level as the console, not the DEBUG detail of the log file.
+        console_level = logging.getLogger().getEffectiveLevel()
+        self.handler.setLevel(console_level if isinstance(console_level, int) else logging.DEBUG)
 
         # Create formatter
         formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")

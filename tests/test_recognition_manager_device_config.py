@@ -2178,13 +2178,14 @@ class TestEnqueueAudioSegment(unittest.TestCase):
         # Segments carry the session language they were recorded under (#805).
         assert manager._segment_queue.get_nowait() == (buf, "en-us")
 
-    def test_enqueue_drops_oldest_when_queue_full(self):
-        """When queue is full, oldest item is dropped and new one inserted."""
+    def test_enqueue_never_drops_segments(self):
+        """The queue is unbounded: every segment stays, in order."""
         manager = _make_manager()
-        manager._segment_queue = queue.Queue(maxsize=1)
-        manager._segment_queue.put_nowait(([b"old"], "en-us"))
-        manager._enqueue_audio_segment([b"new"])
-        assert manager._segment_queue.get_nowait() == ([b"new"], "en-us")
+        manager._segment_queue = queue.Queue()
+        for index in range(100):
+            manager._enqueue_audio_segment([bytes([index])])
+        assert manager._segment_queue.qsize() == 100
+        assert manager._segment_queue.get_nowait() == ([b"\x00"], "en-us")
 
 
 class TestPerformRecognition(unittest.TestCase):

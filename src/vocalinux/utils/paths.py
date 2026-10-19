@@ -15,6 +15,36 @@ def xdg_data_home() -> str:
     return os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
 
 
+def xdg_cache_home() -> str:
+    """Return ``$XDG_CACHE_HOME`` or ``~/.cache`` (empty values treated as unset)."""
+    return os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+
+
+def xdg_state_home() -> str:
+    """Return ``$XDG_STATE_HOME`` or ``~/.local/state`` (empty values treated as unset)."""
+    return os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+
+
+def cache_dir() -> str:
+    """Return the Vocalinux cache directory."""
+    return os.path.join(xdg_cache_home(), APP_DIR_NAME)
+
+
+def state_dir() -> str:
+    """Return the Vocalinux state directory."""
+    return os.path.join(xdg_state_home(), APP_DIR_NAME)
+
+
+def recordings_dir() -> str:
+    """Return the directory where dictation recordings are kept for recovery."""
+    return os.path.join(cache_dir(), "recordings")
+
+
+def logs_dir() -> str:
+    """Return the directory of the persistent rotating log file."""
+    return os.path.join(state_dir(), "logs")
+
+
 def config_dir() -> str:
     """Return the Vocalinux configuration directory."""
     return os.path.join(xdg_config_home(), APP_DIR_NAME)

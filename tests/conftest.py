@@ -35,6 +35,7 @@ _XDG_ISOLATION_DIR = tempfile.mkdtemp(prefix="vocalinux-pytest-xdg-")
 os.environ["XDG_DATA_HOME"] = os.path.join(_XDG_ISOLATION_DIR, "data")
 os.environ["XDG_CONFIG_HOME"] = os.path.join(_XDG_ISOLATION_DIR, "config")
 os.environ["XDG_CACHE_HOME"] = os.path.join(_XDG_ISOLATION_DIR, "cache")
+os.environ["XDG_STATE_HOME"] = os.path.join(_XDG_ISOLATION_DIR, "state")
 for _var in (
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_TYPE",
@@ -139,6 +140,18 @@ def _suppress_desktop_notifications(request):
         return
     with patch("vocalinux.speech_recognition.recognition_manager._show_notification"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_persistent_log_file(monkeypatch):
+    """Keep main() from adding the rotating log file handler to the root logger.
+
+    Its time-based rotation check calls time.time() on every log record, which
+    breaks tests that patch time.time.
+    """
+    main_module = sys.modules.get("vocalinux.main")
+    if main_module is not None and hasattr(main_module, "setup_file_logging"):
+        monkeypatch.setattr(main_module, "setup_file_logging", lambda *args, **kwargs: None)
 
 
 @pytest.fixture(autouse=True)
