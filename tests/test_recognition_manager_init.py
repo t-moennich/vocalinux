@@ -97,6 +97,29 @@ class TestSpeechRecognitionManagerInit:
         # Just verify manager initializes without error
         assert manager is not None
 
+    def test_manager_init_lazy_load_skips_model(self):
+        """lazy_load starts without a model, marked for reload on first dictation."""
+        from vocalinux.speech_recognition.recognition_manager import SpeechRecognitionManager
+
+        with patch.object(SpeechRecognitionManager, "_init_whispercpp") as init:
+            manager = SpeechRecognitionManager(
+                engine="whisper_cpp", model_size="small", language="en-us", lazy_load=True
+            )
+        init.assert_not_called()
+        assert manager.model_ready is False
+        assert manager._idle_unloaded is True
+
+    def test_manager_init_loads_model_by_default(self):
+        """Without lazy_load the engine is initialized at startup."""
+        from vocalinux.speech_recognition.recognition_manager import SpeechRecognitionManager
+
+        with patch.object(SpeechRecognitionManager, "_init_whispercpp") as init:
+            manager = SpeechRecognitionManager(
+                engine="whisper_cpp", model_size="small", language="en-us"
+            )
+        init.assert_called_once()
+        assert manager._idle_unloaded is False
+
 
 class TestGetAudioInputDevices:
     """Tests for get_audio_input_devices function."""

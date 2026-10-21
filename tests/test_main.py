@@ -243,6 +243,7 @@ class TestMainModule(unittest.TestCase):
                 save_recordings=True,
                 recordings_retention_hours=24,
                 buffer_during_reload=True,
+                lazy_load=True,
                 voice_commands_enabled=None,
                 audio_device_index=None,
                 audio_device_name=None,

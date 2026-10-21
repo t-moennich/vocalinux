@@ -198,6 +198,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "idle_timeout_seconds": 300,  # 5 minutes when enabled
         "buffer_during_reload": False,  # Record while the idle model loads
+        "load_on_demand": False,  # Don't load the model at startup, only on first dictation
     },
     "text_injection": {
         "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings

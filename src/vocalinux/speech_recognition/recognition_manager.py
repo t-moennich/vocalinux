@@ -407,6 +407,7 @@ class SpeechRecognitionManager:
             model_size: The size of the model to use ("small", "medium", "large")
             defer_download: If True, don't download missing models at startup (default: True)
             audio_device_index: Optional audio input device index (None for default)
+            lazy_load: If True, don't load the model at startup; first dictation loads it
         """
         self.engine = engine
         self.model_size = model_size
@@ -573,6 +574,12 @@ class SpeechRecognitionManager:
         logger.info(
             f"Initializing speech recognition with {engine} engine, {self.language} language and {model_size} model"
         )
+
+        if kwargs.get("lazy_load", False):
+            # Start as if idle keep-alive had unloaded the model; first dictation loads it
+            self._idle_unloaded = True
+            logger.info("Lazy load: speech model loads on first dictation")
+            return
 
         # Initialize the selected speech recognition engine
         if engine == "vosk":
