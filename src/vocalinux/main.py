@@ -115,6 +115,11 @@ def parse_arguments():
         help="Stop voice typing on a running instance (via D-Bus) and exit",
     )
     parser.add_argument(
+        "--unload",
+        action="store_true",
+        help="Unload the speech model on a running instance (via D-Bus) and exit",
+    )
+    parser.add_argument(
         "--dictionary-file",
         type=str,
         help=(
@@ -144,7 +149,7 @@ def parse_arguments():
 
 
 # CLI flags that trigger a running instance instead of starting a new one.
-_TRIGGER_FLAGS = ("toggle", "start", "stop")
+_TRIGGER_FLAGS = ("toggle", "start", "stop", "unload")
 
 
 def _selected_trigger(args: argparse.Namespace) -> Optional[str]:

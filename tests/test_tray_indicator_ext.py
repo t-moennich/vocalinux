@@ -713,6 +713,27 @@ class TestExternalTriggerHandlers(unittest.TestCase):
         TrayIndicator._external_stop(fake)
         fake.speech_engine.stop_recognition.assert_not_called()
 
+    def test_manual_unload_when_idle(self):
+        """_unload_model_manually cancels keep-alive and unloads with reason manual."""
+        from vocalinux.common_types import RecognitionState
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        fake = MagicMock()
+        fake.speech_engine.state = RecognitionState.IDLE
+        TrayIndicator._unload_model_manually(fake)
+        fake._model_keepalive.cancel.assert_called_once_with()
+        fake.speech_engine.unload_model.assert_called_once_with(reason="manual")
+
+    def test_manual_unload_noop_while_dictating(self):
+        """_unload_model_manually does nothing during active dictation."""
+        from vocalinux.common_types import RecognitionState
+        from vocalinux.ui.tray_indicator import TrayIndicator
+
+        fake = MagicMock()
+        fake.speech_engine.state = RecognitionState.LISTENING
+        TrayIndicator._unload_model_manually(fake)
+        fake.speech_engine.unload_model.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

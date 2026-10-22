@@ -539,6 +539,13 @@ class TestUnloadModelAndAutoPauseBlock(unittest.TestCase):
         self.assertTrue(mgr.is_idle_unloaded)
         self.assertIsNone(mgr.model)
 
+    def test_unload_manual_allows_lazy_reload(self):
+        mgr = self._make_manager()
+        mgr.unload_model(reason="manual")
+        self.assertFalse(mgr.is_auto_paused)
+        self.assertTrue(mgr.is_idle_unloaded)
+        self.assertIsNone(mgr.model)
+
     def test_ensure_model_loaded_reloads_after_idle_unload(self):
         mgr = self._make_manager()
         mgr.unload_model(reason="idle_keepalive")

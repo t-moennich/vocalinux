@@ -4597,9 +4597,9 @@ class SpeechRecognitionManager:
             reason: Why the model is being unloaded:
                 - ``"auto_pause"``: a configured game/app is running; dictation is blocked
                   until :meth:`reinitialize_after_resume` (or auto-pause resume).
-                - ``"idle_keepalive"``: idle keep-alive timeout; next dictation may
-                  lazy-reload via :meth:`ensure_model_loaded`.
-                - ``"manual"`` / other: unload only without setting pause/idle flags.
+                - ``"idle_keepalive"`` / ``"manual"``: idle keep-alive timeout or user
+                  request; next dictation may lazy-reload via :meth:`ensure_model_loaded`.
+                - other: unload only without setting pause/idle flags.
         """
         self._cancel_reload_recording()
         logger.info("Unloading speech model (reason=%s)", reason)
@@ -4626,11 +4626,11 @@ class SpeechRecognitionManager:
             self._auto_paused = True
             self._idle_unloaded = False
             logger.info("Speech model unloaded; dictation blocked until auto-pause clears")
-        elif reason == "idle_keepalive":
+        elif reason in ("idle_keepalive", "manual"):
             # Auto-pause owns lifecycle if both could apply
             if not self._auto_paused:
                 self._idle_unloaded = True
-            logger.info("Speech model unloaded after idle keep-alive timeout")
+            logger.info("Speech model unloaded (%s); next dictation reloads it", reason)
         else:
             logger.info("Speech model unloaded")
 

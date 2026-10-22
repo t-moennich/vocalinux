@@ -304,6 +304,7 @@ class TrayIndicator:
             on_toggle=self._toggle_recognition,
             on_start=self._external_start,
             on_stop=self._external_stop,
+            on_unload=self._unload_model_manually,
             on_registration_failed=self._on_dbus_registration_failed,
         )
 
@@ -575,6 +576,8 @@ class TrayIndicator:
         self.menu = Gtk.Menu()
 
         # Add menu items
+        self._add_menu_item("Unload Speech Model", self._on_unload_model_clicked)
+        self._add_menu_separator()
         self._add_menu_item("Start Voice Typing", self._on_start_clicked)
         self._add_menu_item("Stop Voice Typing", self._on_stop_clicked)
         self._add_menu_item("Transcribe Audio File\u2026", self._on_transcribe_file_clicked)
@@ -1246,6 +1249,23 @@ class TrayIndicator:
         """Handle click on the Stop Voice Typing menu item."""
         logger.debug("Stop Voice Typing clicked")
         self.speech_engine.stop_recognition()
+
+    def _on_unload_model_clicked(self, widget):
+        """Handle click on the Unload Speech Model menu item."""
+        self._unload_model_manually()
+
+    def _unload_model_manually(self) -> None:
+        """Free the speech model now; the next dictation reloads it."""
+        if self.speech_engine.state != RecognitionState.IDLE:
+            logger.info("Manual unload skipped: dictation is active")
+            return
+
+        keepalive = getattr(self, "_model_keepalive", None)
+        if keepalive is not None:
+            keepalive.cancel()
+        unload = getattr(self.speech_engine, "unload_model", None)
+        if callable(unload):
+            unload(reason="manual")
 
     def _refresh_history_menu(self) -> bool:
         """Rebuild the Recent Snippets submenu from the current history."""

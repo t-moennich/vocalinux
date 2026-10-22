@@ -25,6 +25,7 @@ COMMAND_METHODS = {
     "toggle": "Toggle",
     "start": "Start",
     "stop": "Stop",
+    "unload": "Unload",
 }
 
 _INTROSPECTION_XML = """
@@ -33,6 +34,7 @@ _INTROSPECTION_XML = """
     <method name="Toggle"/>
     <method name="Start"/>
     <method name="Stop"/>
+    <method name="Unload"/>
   </interface>
 </node>
 """
@@ -62,12 +64,15 @@ class VocalinuxDBusService:
         on_start: Callable[[], None],
         on_stop: Callable[[], None],
         on_registration_failed: Optional[Callable[[], None]] = None,
+        on_unload: Optional[Callable[[], None]] = None,
     ) -> None:
         self._callbacks = {
             "Toggle": on_toggle,
             "Start": on_start,
             "Stop": on_stop,
         }
+        if on_unload is not None:
+            self._callbacks["Unload"] = on_unload
         self._on_registration_failed = on_registration_failed
         self._owner_id = 0
         self._registration_id = 0
@@ -176,7 +181,7 @@ def send_command(command: str) -> bool:
     """Forward a control command to a running instance over the session bus.
 
     Args:
-        command: One of ``"toggle"``, ``"start"``, ``"stop"``.
+        command: One of ``"toggle"``, ``"start"``, ``"stop"``, ``"unload"``.
 
     Returns:
         True if the call reached a running instance, False otherwise.

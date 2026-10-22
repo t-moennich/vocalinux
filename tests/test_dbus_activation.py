@@ -120,6 +120,29 @@ def test_method_call_routes_to_callback(method, expected):
     invocation.return_value.assert_called_once()
 
 
+def test_unload_method_routes_to_callback():
+    """Unload invokes on_unload when the caller registered it."""
+    from vocalinux import dbus_service
+
+    on_unload = MagicMock()
+    service = dbus_service.VocalinuxDBusService(
+        on_toggle=MagicMock(), on_start=MagicMock(), on_stop=MagicMock(), on_unload=on_unload
+    )
+    invocation = MagicMock()
+    with patch.object(dbus_service.GLib, "idle_add", side_effect=lambda fn, *a: fn(*a)):
+        service._handle_method_call(
+            MagicMock(),
+            "sender",
+            dbus_service.OBJECT_PATH,
+            dbus_service.INTERFACE_NAME,
+            "Unload",
+            None,
+            invocation,
+        )
+    on_unload.assert_called_once_with()
+    invocation.return_value.assert_called_once()
+
+
 def test_unknown_method_returns_error():
     """An unknown method name returns a D-Bus error and no callback runs."""
     from vocalinux import dbus_service
